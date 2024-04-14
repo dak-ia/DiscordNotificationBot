@@ -1,0 +1,77 @@
+name: Build and release
+
+on:
+  release:
+    types:
+      - released
+      - prereleased
+
+concurrency: build-and-release
+
+env:
+  app_name: DiscordNotificationBot
+  csproj_path: DiscordNotificationBot.csproj
+  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  build-and-release:
+    if: github.actor == 'dak-ia'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check version pattern
+        run: |-
+          input_version_pattern=$(echo ${{ github.ref_name }} | grep -E -o "^[0-9]+\.[0-9]+\.[0-9]+(-alpha|-beta|-rc|)$")
+          version_prefix_pattern=$(cat ${{ env.csproj_path }} | grep -E -o "<VersionPrefix>[0-9]+\.[0-9]+\.[0-9]+</VersionPrefix>")
+          version_suffix_pattern=$(cat ${{ env.csproj_path }} | grep -E -o "<VersionSuffix>(alpha|beta|rc|)</VersionSuffix>")
+          if [ -z "${input_version_pattern}" ] || [ -z "${version_prefix_pattern}" ] || [ -z "${version_suffix_pattern}" ]; then
+            echo "Version pattern is invalid."
+            exit 1
+          fi
+
+      - name: Setup .NET 8.0.x
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: dotnet build
+        run: dotnet build ${{ env.csproj_path }}
+
+      - name: Update version
+        run: |-
+          version_prefix=$(echo ${{ github.ref_name }} | grep -E -o ^[0-9]+\.[0-9]+\.[0-9]+)
+          version_suffix=$(echo ${{ github.ref_name }} | grep -E -o "(alpha|beta|rc|)$")
+          sed -i -r "s/(<VersionPrefix>)[0-9]+\.[0-9]+\.[0-9]+<\/VersionPrefix>/<VersionPrefix>${version_prefix}<\/VersionPrefix>/" ${{ env.csproj_path }}
+          sed -i -r "s/(<VersionSuffix>).*<\/VersionSuffix>/<VersionSuffix>${version_suffix}<\/VersionSuffix>/" ${{ env.csproj_path }}
+
+      - name: dotnet publish win-x64
+        run: >
+          dotnet publish ${{ env.csproj_path }}
+          -c Release
+          -r win-x64
+          --self-contained false
+          -p:PublishSingleFile=true
+          -p:PublishReadyToRun=true
+          -p:PublishTrimmed=false
+          -p:IncludeNativeLibrariesForSelfExtract=true
+          -o outputs/
+
+      - name: Compress to zip
+        run: zip --junk-paths ${{ env.app_name}}.zip ./outputs/${{ env.app_name}}.exe README.md LICENSE
+
+      - name: Upload release asset
+        run: |-
+          gh release upload ${{ github.ref_name }} ${{ env.app_name }}.zip --clobber
+
+      - name: Commit version change and create PR
+        run: |-
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git checkout -b update-version-to-${{ github.ref_name }}
+          git diff --exit-code ${{ env.csproj_path }} && exit 0
+          git add ${{ env.csproj_path }}
+          git commit -m "Update version to ${{ github.ref_name }}"
+          git push -u origin update-version-to-${{ github.ref_name }}
+          gh pr create --title "Update version to ${{ github.ref_name }}" --body "## Update version to ${{ github.ref_name }}" --base main --head update-version-to-${{ github.ref_name }}
